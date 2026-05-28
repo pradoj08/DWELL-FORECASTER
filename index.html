@@ -5012,9 +5012,17 @@ table[aria-label="Inbound summary table"] td:nth-child(5){width:10%;}
   var SUPABASE_URL = 'https://wjcicllxysvygkeqzqas.supabase.co';
   var SUPABASE_KEY = 'sb_publishable_2BLd6GJxw5m6gnDL1Ok3nQ_Tf8Uef2-';
   var APP_STATE_TABLE = 'dwell_app_state';
-  var APP_STATE_KEY = 'dwell_forecaster_full_local_storage_v1';
+
+  // The Supabase SQL we just set up seeds/uses `global`.
+  // Older builds used `dwell_forecaster_full_local_storage_v1`, so this build can read both and writes both.
+  var PRIMARY_STATE_KEY = 'global';
+  var LEGACY_STATE_KEY = 'dwell_forecaster_full_local_storage_v1';
+  var STATE_KEYS = [PRIMARY_STATE_KEY, LEGACY_STATE_KEY];
+
   var LAST_SYNC_KEY = '__dwell_supabase_last_sync__';
+  var LAST_REMOTE_KEY = '__dwell_supabase_last_remote_updated__';
   var HYDRATED_SESSION_KEY = '__dwell_supabase_hydrated_this_session__';
+  var CLIENT_ID_KEY = '__dwell_supabase_client_id__';
 
   var originalSetItem = localStorage.setItem.bind(localStorage);
   var originalRemoveItem = localStorage.removeItem.bind(localStorage);
@@ -5024,11 +5032,27 @@ table[aria-label="Inbound summary table"] td:nth-child(5){width:10%;}
   var saveTimer = null;
   var saveInFlight = false;
   var pendingSave = false;
+  var applyingRemote = false;
+  var lastLocalEditAt = 0;
+  var lastError = null;
+
+  function getClientId(){
+    var id = localStorage.getItem(CLIENT_ID_KEY);
+    if(!id){
+      id = 'client_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
+      originalSetItem(CLIENT_ID_KEY, id);
+    }
+    return id;
+  }
+
+  var CLIENT_ID = getClientId();
 
   window.DWELL_SUPABASE_CONFIG = {
     url: SUPABASE_URL,
     table: APP_STATE_TABLE,
-    key: APP_STATE_KEY
+    key: PRIMARY_STATE_KEY,
+    legacyKey: LEGACY_STATE_KEY,
+    clientId: CLIENT_ID
   };
 
   function shouldSyncKey(key){
@@ -5053,12 +5077,15 @@ table[aria-label="Inbound summary table"] td:nth-child(5){width:10%;}
       localStorage.getItem('inbound-summary-app-v1') ||
       localStorage.getItem('inbound-summary-archive-bank-v1') ||
       localStorage.getItem('dwellAppState') ||
-      localStorage.getItem('dwell_forecaster_state')
+      localStorage.getItem('dwell_forecaster_state') ||
+      localStorage.getItem('dwellForecastRows') ||
+      localStorage.getItem('dwellTrainBank') ||
+      localStorage.getItem('dwellDepTimes')
     );
   }
 
   function waitForSupabaseGlobal(timeoutMs){
-    timeoutMs = timeoutMs || 4000;
+    timeoutMs = timeoutMs || 6000;
     var started = Date.now();
     return new Promise(function(resolve){
       (function check(){
@@ -5069,7 +5096,27 @@ table[aria-label="Inbound summary table"] td:nth-child(5){width:10%;}
     });
   }
 
+  function newestRow(rows){
+    if(!Array.isArray(rows) || !rows.length) return null;
+    rows.sort(function(a,b){
+      var at = Date.parse((a && a.updated_at) || (a && a.value && a.value.savedAt) || '') || 0;
+      var bt = Date.parse((b && b.updated_at) || (b && b.value && b.value.savedAt) || '') || 0;
+      return bt - at;
+    });
+    return rows[0] || null;
+  }
+
+  async function fetchNewestRemote(){
+    var result = await client
+      .from(APP_STATE_TABLE)
+      .select('key,value,updated_at')
+      .in('key', STATE_KEYS);
+    if(result && result.error) throw result.error;
+    return newestRow((result && result.data) || []);
+  }
+
   async function saveSnapshotNow(){
+    if(applyingRemote) return;
     if(!client || !syncReady){ pendingSave = true; return; }
     if(saveInFlight){ pendingSave = true; return; }
     saveInFlight = true;
@@ -5079,119 +5126,182 @@ table[aria-label="Inbound summary table"] td:nth-child(5){width:10%;}
       var payload = {
         localStorage: collectLocalStorageSnapshot(),
         savedAt: now,
+        savedBy: CLIENT_ID,
         app: 'dwell_forecaster_html'
       };
+      var rows = STATE_KEYS.map(function(k){
+        return { key: k, value: payload, updated_at: now };
+      });
       var result = await client
         .from(APP_STATE_TABLE)
-        .upsert({ key: APP_STATE_KEY, value: payload, updated_at: now }, { onConflict: 'key' });
+        .upsert(rows, { onConflict: 'key' });
       if(result && result.error) throw result.error;
       originalSetItem(LAST_SYNC_KEY, now);
-      window.dispatchEvent(new CustomEvent('dwell:supabase-save-ok', { detail: { savedAt: now } }));
+      originalSetItem(LAST_REMOTE_KEY, now);
+      lastError = null;
+      window.dispatchEvent(new CustomEvent('dwell:supabase-save-ok', { detail: { savedAt: now, key: PRIMARY_STATE_KEY } }));
     }catch(err){
+      lastError = err;
       console.warn('Supabase save failed. App will continue using localStorage.', err);
       window.dispatchEvent(new CustomEvent('dwell:supabase-save-error', { detail: err }));
     }finally{
       saveInFlight = false;
       if(pendingSave){
         pendingSave = false;
-        scheduleSave();
+        scheduleSave(900);
       }
     }
   }
 
-  function scheduleSave(){
+  function scheduleSave(delay){
+    if(applyingRemote) return;
     if(!syncReady){ pendingSave = true; return; }
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(saveSnapshotNow, 700);
+    saveTimer = setTimeout(saveSnapshotNow, typeof delay === 'number' ? delay : 700);
+  }
+
+  function applyRemoteSnapshot(row, reload){
+    if(!row || !row.value || !row.value.localStorage) return false;
+    applyingRemote = true;
+    try{
+      Object.keys(row.value.localStorage).forEach(function(key){
+        if(shouldSyncKey(key)) originalSetItem(key, row.value.localStorage[key]);
+      });
+      var remoteUpdated = row.updated_at || row.value.savedAt || new Date().toISOString();
+      originalSetItem(LAST_SYNC_KEY, remoteUpdated);
+      originalSetItem(LAST_REMOTE_KEY, remoteUpdated);
+      sessionStorage.setItem(HYDRATED_SESSION_KEY, '1');
+      window.dispatchEvent(new CustomEvent('dwell:supabase-hydrated', { detail: { updatedAt: remoteUpdated, key: row.key } }));
+      if(reload){ setTimeout(function(){ location.reload(); }, 80); }
+      return true;
+    }finally{
+      applyingRemote = false;
+    }
   }
 
   async function hydrateFromSupabase(){
     try{
-      var result = await client
-        .from(APP_STATE_TABLE)
-        .select('key,value,updated_at')
-        .eq('key', APP_STATE_KEY)
-        .maybeSingle();
-      if(result && result.error) throw result.error;
-      var data = result ? result.data : null;
-      if(!data || !data.value || !data.value.localStorage) return false;
+      var row = await fetchNewestRemote();
+      if(!row || !row.value || !row.value.localStorage) return false;
 
       var alreadyHydrated = sessionStorage.getItem(HYDRATED_SESSION_KEY) === '1';
       var localMarker = localStorage.getItem(LAST_SYNC_KEY);
-      var remoteUpdated = data.updated_at || data.value.savedAt || '';
+      var remoteUpdated = row.updated_at || row.value.savedAt || '';
       var remoteTime = remoteUpdated ? Date.parse(remoteUpdated) : 0;
       var localTime = localMarker ? Date.parse(localMarker) : 0;
       var localHasState = hasMeaningfulLocalState();
 
-      // New device / empty browser: pull remote state.
-      // Existing browser: pull only when the remote state is newer than the last successful local sync.
-      var shouldHydrate = !alreadyHydrated && (!localHasState || (localTime && remoteTime && remoteTime > localTime + 1000));
+      var shouldHydrate = !alreadyHydrated && (!localHasState || !localTime || (remoteTime && remoteTime > localTime + 1000));
       if(!shouldHydrate) return false;
-
-      Object.keys(data.value.localStorage).forEach(function(key){
-        if(shouldSyncKey(key)) originalSetItem(key, data.value.localStorage[key]);
-      });
-      if(remoteUpdated) originalSetItem(LAST_SYNC_KEY, new Date(remoteTime || Date.now()).toISOString());
-      sessionStorage.setItem(HYDRATED_SESSION_KEY, '1');
-      window.dispatchEvent(new CustomEvent('dwell:supabase-hydrated', { detail: { updatedAt: remoteUpdated } }));
-
-      // The app reads localStorage during initial script load. Reload once so all existing code boots from remote state.
-      setTimeout(function(){ location.reload(); }, 50);
-      return true;
+      return applyRemoteSnapshot(row, true);
     }catch(err){
+      lastError = err;
       console.warn('Supabase load failed. App will continue using localStorage.', err);
       window.dispatchEvent(new CustomEvent('dwell:supabase-load-error', { detail: err }));
       return false;
     }
   }
 
+  async function pullRemoteIfNewer(){
+    if(!client || !syncReady || applyingRemote || saveInFlight) return;
+    try{
+      var row = await fetchNewestRemote();
+      if(!row || !row.value || !row.value.localStorage) return;
+      if(row.value.savedBy === CLIENT_ID) return;
+      var remoteUpdated = row.updated_at || row.value.savedAt || '';
+      var remoteTime = Date.parse(remoteUpdated) || 0;
+      var localTime = Date.parse(localStorage.getItem(LAST_SYNC_KEY) || '') || 0;
+      var recentlyEdited = Date.now() - lastLocalEditAt < 2500;
+      if(remoteTime && remoteTime > localTime + 1000 && !recentlyEdited){
+        applyRemoteSnapshot(row, true);
+      }
+    }catch(err){
+      lastError = err;
+      console.warn('Supabase background pull failed.', err);
+    }
+  }
+
   localStorage.setItem = function(key, value){
     var result = originalSetItem(key, value);
-    if(syncReady && shouldSyncKey(key)) scheduleSave();
+    if(syncReady && shouldSyncKey(key) && !applyingRemote){
+      lastLocalEditAt = Date.now();
+      scheduleSave();
+    }
     return result;
   };
 
   localStorage.removeItem = function(key){
     var result = originalRemoveItem(key);
-    if(syncReady && shouldSyncKey(key)) scheduleSave();
+    if(syncReady && shouldSyncKey(key) && !applyingRemote){
+      lastLocalEditAt = Date.now();
+      scheduleSave();
+    }
     return result;
   };
 
   localStorage.clear = function(){
     var result = originalClear();
-    if(syncReady) scheduleSave();
+    if(syncReady && !applyingRemote){
+      lastLocalEditAt = Date.now();
+      scheduleSave();
+    }
     return result;
   };
 
-  window.dwellForceSupabaseSave = function(){ scheduleSave(); };
+  function bindUserActivitySave(){
+    ['change','input','click'].forEach(function(type){
+      document.addEventListener(type, function(){
+        if(!syncReady || applyingRemote) return;
+        lastLocalEditAt = Date.now();
+        // Let the app write localStorage first, then capture the finished state.
+        scheduleSave(type === 'input' ? 1200 : 900);
+      }, true);
+    });
+    window.addEventListener('beforeunload', function(){
+      if(syncReady && !applyingRemote) saveSnapshotNow();
+    });
+  }
+
+  window.dwellForceSupabaseSave = function(){ scheduleSave(0); };
+  window.dwellForceSupabasePull = function(){ pullRemoteIfNewer(); };
   window.dwellSupabaseStatus = function(){
     return {
       configured: !!client,
       ready: syncReady,
       table: APP_STATE_TABLE,
-      key: APP_STATE_KEY,
-      lastSync: localStorage.getItem(LAST_SYNC_KEY) || null
+      key: PRIMARY_STATE_KEY,
+      legacyKey: LEGACY_STATE_KEY,
+      clientId: CLIENT_ID,
+      lastSync: localStorage.getItem(LAST_SYNC_KEY) || null,
+      lastRemote: localStorage.getItem(LAST_REMOTE_KEY) || null,
+      lastError: lastError ? (lastError.message || String(lastError)) : null
     };
   };
 
   (async function initSupabaseSync(){
-    var available = await waitForSupabaseGlobal(4000);
+    var available = await waitForSupabaseGlobal(6000);
     if(!available){
+      lastError = new Error('Supabase client library did not load');
       console.warn('Supabase client library did not load. App will continue using localStorage.');
       return;
     }
-    client = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+    client = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false }
+    });
     window.dwellSupabaseClient = client;
     var reloading = await hydrateFromSupabase();
     if(reloading) return;
     syncReady = true;
-    if(pendingSave) scheduleSave();
+    bindUserActivitySave();
+    if(pendingSave) scheduleSave(300);
 
-    // Save current browser state after startup so Supabase is populated even before the first manual edit.
-    setTimeout(scheduleSave, 1200);
+    // Startup save, then background pull so already-open devices catch updates from other devices.
+    setTimeout(function(){ scheduleSave(0); }, 1200);
+    setInterval(pullRemoteIfNewer, 8000);
   })();
 })();
 </script>
+
 
 
 <style id="archive-action-display-error-fix">
